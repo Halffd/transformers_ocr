@@ -16,8 +16,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from argparse import RawTextHelpFormatter
 from typing import AnyStr, IO, Iterable, Optional
+import fcntl
+import socket
+import struct
+import pickle
 
 MANGA_OCR_PREFIX = os.path.join(os.environ["HOME"], ".local", "share", "manga_ocr")
 MANGA_OCR_PYENV_PATH = os.path.join(MANGA_OCR_PREFIX, "pyenv")
@@ -28,7 +33,7 @@ CONFIG_PATH = os.path.join(
     "transformers_ocr",
     "config",
 )
-PIPE_PATH = "/tmp/manga_ocr.fifo"
+SOCKET_PATH = "/tmp/manga_ocr.sock"
 PID_FILE = "/tmp/manga_ocr.pid"
 PROGRAM = "transformers_ocr"
 JOIN = "、"
@@ -43,6 +48,10 @@ CLIP_COPY_ARGS = (
 )
 CLIP_TEXT_PLACEHOLDER = '%TEXT%'
 
+# Add path to local manga-ocr
+MANGA_OCR_SRC_PATH = os.path.join(os.path.dirname(__file__), "manga-ocr")
+if os.path.exists(MANGA_OCR_SRC_PATH):
+    sys.path.insert(0, MANGA_OCR_SRC_PATH)
 
 class Platform(enum.Enum):
     GNOME = enum.auto()
@@ -159,29 +168,45 @@ def take_screenshot(screenshot_path):
 
 
 def prepare_pipe():
-    if os.path.isfile(PIPE_PATH):
-        os.remove(PIPE_PATH)
-    if not is_fifo(PIPE_PATH):
-        os.mkfifo(PIPE_PATH)
+    # Remove this function as we're using sockets now
+    pass
 
 
 def write_command_to_pipe(command: str, file_path: str):
-    with open(PIPE_PATH, "w") as pipe:
-        pipe.write(OcrCommand(action=command, file_path=file_path).as_json())
+    client = OcrClient(debug=args.debug)
+    try:
+        client.send_command(OcrCommand(action=command, file_path=file_path))
+    except Exception as e:
+        raise IOError(f"Failed to send command: {e}")
 
 
 def run_ocr(command: str, image_path: Optional[str] = None) -> None:
-    ensure_listening()
-    if image_path is not None:
-        write_command_to_pipe(command, image_path)
-        return
+    try:
+        ensure_listening()
+        
+        if image_path is not None:
+            write_command_to_pipe(command, image_path)
+            return
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
-        try:
-            take_screenshot(screenshot_file.name)
-        except subprocess.CalledProcessError as ex:
-            raise ScreenshotCancelled() from ex
-        write_command_to_pipe(command, screenshot_file.name)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+            try:
+                take_screenshot(screenshot_file.name)
+            except subprocess.CalledProcessError as ex:
+                raise ScreenshotCancelled() from ex
+                
+            # Add small delay to ensure file is written
+            time.sleep(0.1)
+            
+            try:
+                write_command_to_pipe(command, screenshot_file.name)
+            except IOError as e:
+                notify_send(f"Failed to communicate with OCR service: {e}")
+                # Cleanup
+                os.unlink(screenshot_file.name)
+                raise
+    except KeyboardInterrupt:
+        notify_send("OCR cancelled by user")
+        sys.exit(1)
 
 
 def is_running(pid: int) -> bool:
@@ -198,24 +223,65 @@ def get_pid() -> int | None:
         return pid if is_running(pid) else None
 
 
+def debug_log(msg: str, debug_enabled: bool = False):
+    if debug_enabled:
+        print(f"[DEBUG] {msg}")
+
+
 def ensure_listening():
     if os.path.exists(MANGA_OCR_PREFIX):
         if get_pid() is None:
+            debug_log("Starting manga_ocr listener...", args.debug)
+            
+            python_path = os.path.join(MANGA_OCR_PYENV_PATH, "bin", "python3")
+            if not os.path.exists(python_path):
+                print("Virtual environment not found. Please run 'download' first.")
+                sys.exit(1)
+            
+            cmd = [python_path, __file__]
+            if args.debug:
+                cmd.append("-d")
+            cmd.extend(["start", "--foreground"])
+            
+            debug_log(f"Running command: {' '.join(cmd)}", args.debug)
+            
+            # Start server in background
             p = subprocess.Popen(
-                (
-                    os.path.join(MANGA_OCR_PREFIX, "pyenv", "bin", "python3"),
-                    __file__,
-                    "start",
-                    "--foreground",
-                ),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                cmd,
+                stdout=subprocess.PIPE if not args.debug else None,
+                stderr=subprocess.PIPE if not args.debug else None,
+                start_new_session=True
             )
+            
+            # Write PID file
             with open(PID_FILE, "w") as pid_file:
                 pid_file.write(str(p.pid))
-            print("Started manga_ocr listener.")
+            
+            # Wait for socket to be available
+            start_time = time.time()
+            while time.time() - start_time < 600:
+                if os.path.exists(SOCKET_PATH):
+                    try:
+                        # Test connection
+                        client = OcrClient(debug=args.debug)
+                        client.send_command(OcrCommand("ping", None))
+                        debug_log("Server is ready", args.debug)
+                        return
+                    except IOError as e:
+                        debug_log(f"Server not ready yet: {e}", args.debug)
+                time.sleep(1)
+                
+            # If we get here, server failed to start
+            p.kill()
+            raise TimeoutError("Server failed to start")
         else:
-            print("Already running.")
+            if os.path.exists(SOCKET_PATH):
+                print("Already running.")
+            else:
+                print("Process exists but socket is missing. Restarting...")
+                stop_listening()
+                time.sleep(1)
+                ensure_listening()
     else:
         print("manga-ocr is not downloaded.")
         sys.exit(1)
@@ -237,9 +303,24 @@ def kill_after(pid: int, timeout_s: float, step_s: float = 0.1):
 
 def stop_listening():
     if (pid := get_pid()) is not None:
-        with open(PIPE_PATH, "w") as pipe:
-            pipe.write(OcrCommand(action="stop", file_path=None).as_json())
-        kill_after(pid, timeout_s=3)
+        try:
+            # Try to send stop command
+            write_command_to_pipe("stop", None)
+            kill_after(pid, timeout_s=3)
+        except (IOError, TimeoutError):
+            # If pipe write fails, force kill
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print("Force killed unresponsive process.")
+            except ProcessLookupError:
+                pass
+        
+        # Clean up files
+        for file in (PID_FILE, SOCKET_PATH):
+            try:
+                os.remove(file)
+            except FileNotFoundError:
+                pass
     else:
         print("Already stopped.")
 
@@ -254,9 +335,20 @@ def is_fifo(path: AnyStr) -> bool:
 def notify_send(msg: str):
     print(msg)
     try:
+        # First attempt: standard notify-send
         subprocess.Popen(("notify-send", "manga-ocr", msg,), shell=False)
-    except FileNotFoundError:
-        pass
+    except (FileNotFoundError, OSError):
+        try:
+            # Fallback: Try with gdbus (works on many systems)
+            subprocess.Popen([
+                "gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                "--object-path", "/org/freedesktop/Notifications",
+                "--method", "org.freedesktop.Notifications.Notify",
+                "manga-ocr", "0", "", "manga-ocr", msg, "[]", "{}", "5000"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (FileNotFoundError, OSError):
+            # If everything fails, just print to console (already done above)
+            pass
 
 
 def is_valid_key_val_pair(line: str) -> bool:
@@ -299,45 +391,126 @@ def iter_commands(stream: IO) -> Iterable[OcrCommand]:
 
 
 class MangaOcrWrapper:
-    def __init__(self):
-        from manga_ocr import MangaOcr  # type: ignore
-
+    def __init__(self, debug=False):
         self._config = TrOcrConfig()
-        self._mocr = MangaOcr(force_cpu=self._config.force_cpu)
+        self.debug = debug
+        self._debug_log("Initializing MangaOCR model...")
+        
+        start_time = time.time()
+        try:
+            if MANGA_OCR_SRC_PATH in sys.path:
+                self._debug_log(f"Attempting to load local manga-ocr from {MANGA_OCR_SRC_PATH}")
+                from manga_ocr import MangaOcr
+            else:
+                self._debug_log("Loading system manga-ocr")
+                from manga_ocr import MangaOcr
+                
+            self._mocr = MangaOcr(force_cpu=self._config.force_cpu)
+            init_time = time.time() - start_time
+            self._debug_log(f"Model initialized in {init_time:.2f}s")
+        except ImportError as e:
+            self._debug_log(f"Failed to import manga-ocr: {e}")
+            raise RuntimeError("Failed to initialize manga-ocr. Is it installed?")
+        
         self._on_hold = []
+        self._last_ocr_time = 0
+        self._min_interval = 0.1
+        
+        # Cache the model's device
+        self._device = next(self._mocr.model.parameters()).device
+        self._debug_log(f"Model running on device: {self._device}")
 
-    def init(self):
-        prepare_pipe()
-        print(f"Reading from {PIPE_PATH}")
-        print(f"Custom clip args: {self._config.clip_args}")
-        return self
+    def _debug_log(self, msg: str):
+        if self.debug:
+            print(f"[DEBUG] {msg}")
 
     def _ocr(self, file_path: str) -> str:
-        return (
-            self._mocr(file_path)
-            .replace('...', '…')
-            .replace('。。。', '…')
-            .replace('．．．', '…')
-        )
+        try:
+            # Add rate limiting
+            current_time = time.time()
+            if current_time - self._last_ocr_time < self._min_interval:
+                wait_time = self._min_interval - (current_time - self._last_ocr_time)
+                self._debug_log(f"Rate limiting: waiting {wait_time:.2f}s")
+                time.sleep(wait_time)
+            
+            # Verify file exists and has content
+            self._debug_log(f"Processing file: {file_path}")
+            if not os.path.exists(file_path):
+                msg = "Error: Screenshot file not found"
+                self._debug_log(msg)
+                notify_send(msg)
+                return ""
+                
+            file_size = os.path.getsize(file_path)
+            self._debug_log(f"File size: {file_size} bytes")
+            if file_size == 0:
+                msg = "Error: Empty screenshot file"
+                self._debug_log(msg)
+                notify_send(msg)
+                return ""
+
+            # Perform OCR with detailed timing
+            self._debug_log("Starting OCR...")
+            start_time = time.time()
+            
+            # Break down OCR steps for debugging
+            try:
+                self._debug_log("Loading image...")
+                text = self._mocr(file_path)
+            except Exception as e:
+                self._debug_log(f"OCR internal error: {str(e)}\n{traceback.format_exc()}")
+                raise
+            
+            ocr_time = time.time() - start_time
+            self._last_ocr_time = time.time()
+            self._debug_log(f"OCR completed in {ocr_time:.2f}s")
+            
+            # Validate output
+            if not text or len(text.strip()) == 0:
+                msg = "Warning: No text detected"
+                self._debug_log(msg)
+                notify_send(msg)
+                return ""
+            
+            self._debug_log(f"Raw OCR text: {text}")
+            processed_text = (
+                text.strip()
+                .replace('...', '…')
+                .replace('。。。', '…')
+                .replace('．．．', '…')
+            )
+            self._debug_log(f"Processed text: {processed_text}")
+            return processed_text
+
+        except Exception as e:
+            msg = f"OCR Error: {str(e)}"
+            self._debug_log(f"{msg}\n{traceback.format_exc()}")
+            notify_send(msg)
+            return ""
 
     def _process_command(self, command: OcrCommand):
-        match command:
-            case OcrCommand("stop", _):
-                raise StopRequested()
-            case OcrCommand(action=action, file_path=file_path) if os.path.isfile(file_path):
-                match action:
-                    case "hold":
-                        text = self._ocr(file_path)
-                        self._on_hold.append(text)
-                        notify_send(f"Holding {text}")
-                    case "recognize":
-                        text = JOIN.join((*self._on_hold, self._ocr(file_path)))
-                        self._to_clip(text)
-                        self._on_hold.clear()
-                        self._maybe_save_result(file_path, text)
-                os.remove(file_path)
+        if command.action == "ping":
+            return
+            
+        if command.action == "stop":
+            raise StopRequested()
+            
+        if not command.file_path or not os.path.exists(command.file_path):
+            self._debug_log(f"File not found: {command.file_path}")
+            return
+            
+        try:
+            text = self._ocr(command.file_path)
+            if command.action == "hold":
+                self._on_hold.append(text)
+            else:
+                self._copy_to_clipboard(text)
+                notify_send(text)
+        finally:
+            if command.file_path and os.path.exists(command.file_path):
+                os.unlink(command.file_path)
 
-    def _to_clip(self, text: str):
+    def _copy_to_clipboard(self, text: str):
         cmd_args = list(self._config.clip_args or CLIP_COPY_ARGS)
         try:
             placeholder_position = cmd_args.index(CLIP_TEXT_PLACEHOLDER)
@@ -373,20 +546,142 @@ class MangaOcrWrapper:
     def loop(self):
         try:
             while True:
-                with open(PIPE_PATH) as fifo:
+                with open(SOCKET_PATH) as fifo:
                     for command in iter_commands(fifo):
                         self._process_command(command)
         except StopRequested:
             return notify_send("Stopped listening.")
 
 
-def run_listener():
-    return MangaOcrWrapper().init().loop()
+class OcrServer:
+    def __init__(self, debug=False):
+        self.debug = debug
+        self._wrapper = None  # Initialize later
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+    def _debug_log(self, msg):
+        if self.debug:
+            print(f"[DEBUG] {msg}")
+            
+    def start(self):
+        # Initialize model first
+        if not self._wrapper:
+            self._wrapper = MangaOcrWrapper(debug=self.debug)
+        
+        # Remove existing socket file
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            if os.path.exists(SOCKET_PATH):
+                raise
+
+        self.sock.bind(SOCKET_PATH)
+        self.sock.listen(1)
+        os.chmod(SOCKET_PATH, 0o666)  # Allow other users to connect
+        self._debug_log("Server listening on socket")
+        
+        try:
+            while True:
+                try:
+                    conn, addr = self.sock.accept()
+                    self._debug_log(f"Accepted connection")
+                    self._handle_connection(conn)
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    self._debug_log(f"Error in connection: {e}")
+                    continue
+        finally:
+            self._debug_log("Server shutting down")
+            self.sock.close()
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
+
+    def _handle_connection(self, conn):
+        try:
+            # First read message length (4 bytes)
+            msg_len_data = conn.recv(4)
+            if not msg_len_data:
+                return
+                
+            msg_len = struct.unpack('>I', msg_len_data)[0]
+            self._debug_log(f"Receiving message of length {msg_len}")
+            
+            # Then read the message
+            data = b''
+            while len(data) < msg_len:
+                chunk = conn.recv(min(msg_len - len(data), 4096))
+                if not chunk:
+                    break
+                data += chunk
+            
+            if len(data) < msg_len:
+                self._debug_log("Incomplete message received")
+                return
+                
+            command = pickle.loads(data)
+            self._debug_log(f"Received command: {command}")
+            
+            if command.action == "stop":
+                self._debug_log("Received stop command")
+                conn.close()
+                self.sock.close()
+                os.unlink(SOCKET_PATH)
+                sys.exit(0)
+                
+            self._wrapper._process_command(command)
+            
+        except Exception as e:
+            self._debug_log(f"Error handling connection: {e}\n{traceback.format_exc()}")
+        finally:
+            conn.close()
+
+
+class OcrClient:
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        
+    def _debug_log(self, msg):
+        if self.debug:
+            print(f"[DEBUG] {msg}")
+            
+    def send_command(self, command: OcrCommand, timeout=5):
+        try:
+            self.sock.settimeout(timeout)
+            self.sock.connect(SOCKET_PATH)
+            
+            data = pickle.dumps(command)
+            msg_len = struct.pack('>I', len(data))
+            
+            # Send length prefix and data
+            self.sock.sendall(msg_len)
+            self.sock.sendall(data)
+            
+            self._debug_log(f"Sent command: {command}")
+        except socket.timeout:
+            raise IOError("Connection timed out")
+        except ConnectionRefusedError:
+            raise IOError("Server not running")
+        finally:
+            self.sock.close()
 
 
 def start_listening(args):
     if args.foreground:
-        run_listener()
+        server = OcrServer(debug=args.debug)
+        try:
+            server.start()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+        finally:
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
     else:
         ensure_listening()
 
@@ -405,21 +700,43 @@ def print_status():
 
 
 def download_manga_ocr():
-    print("Downloading manga-ocr...")
+    print("Downloading manga-ocr and dependencies...")
     os.makedirs(MANGA_OCR_PREFIX, exist_ok=True)
+    
+    # Create virtual environment
     subprocess.run(
         ("python3", "-m", "venv", "--symlinks", MANGA_OCR_PYENV_PATH,),
         check=True,
     )
+    
+    # Upgrade pip
     subprocess.run(
         (MANGA_OCR_PYENV_PIP_PATH, "install", "--upgrade", "pip",),
         check=True,
     )
+    
+    # Install PyTorch first
+    print("Installing PyTorch...")
+    subprocess.run(
+        (MANGA_OCR_PYENV_PIP_PATH, "install", "torch", "torchvision",),
+        check=True,
+    )
+    
+    # Install transformers
+    print("Installing transformers...")
+    subprocess.run(
+        (MANGA_OCR_PYENV_PIP_PATH, "install", "transformers",),
+        check=True,
+    )
+    
+    # Install manga-ocr
+    print("Installing manga-ocr...")
     subprocess.run(
         (MANGA_OCR_PYENV_PIP_PATH, "install", "--upgrade", "manga-ocr",),
         check=True,
     )
-    print("Downloaded manga-ocr.")
+    
+    print("Downloaded manga-ocr and all dependencies.")
 
 
 def prog_name():
@@ -437,6 +754,7 @@ def create_args_parser() -> argparse.ArgumentParser:
         description="An OCR tool that uses Transformers.",
         formatter_class=RawTextHelpFormatter,
     )
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode with verbose logging')
     parser.epilog = f"""
 Platform: {CURRENT_PLATFORM.name}
 You need to run '{prog_name()} download' once after installation.
@@ -479,9 +797,20 @@ def main():
     parser = create_args_parser()
     if len(sys.argv) < 2:
         return parser.print_help()
+    
+    global args  # Make args accessible to debug_log
     args = parser.parse_args()
+    
+    if args.debug:
+        print("[DEBUG] Debug mode enabled")
+        
     try:
-        args.func(args)
+        if hasattr(args, 'func'):
+            if args.func == start_listening:
+                # Pass debug flag to MangaOcrWrapper
+                global _wrapper
+                _wrapper = MangaOcrWrapper(debug=args.debug)
+            args.func(args)
     except MissingProgram as ex:
         notify_send(str(ex))
     except ScreenshotCancelled:
