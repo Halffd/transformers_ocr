@@ -153,18 +153,144 @@ def grim_select(screenshot_path: str):
     )
 
 
-def take_screenshot(screenshot_path):
-    match CURRENT_PLATFORM:
-        case Platform.GNOME:
-            gnome_screenshot_select(screenshot_path)
-        case Platform.KDE:
-            spectactle_select(screenshot_path)
-        case Platform.XFCE:
-            xfce_screenshooter_select(screenshot_path)
-        case Platform.Xorg:
-            maim_select(screenshot_path)
-        case Platform.Wayland:
-            grim_select(screenshot_path)
+def gnome_screenshot_full(screenshot_path: str):
+    raise_if_missing("gnome-screenshot")
+    return subprocess.run(
+        ("gnome-screenshot", "-f", screenshot_path,),
+        check=True,
+    )
+
+
+def spectacle_full(screenshot_path: str):
+    raise_if_missing("spectacle")
+    return subprocess.run(
+        ("spectacle", "-n", "-b", "-f", "-o", screenshot_path,),
+        check=True,
+        stderr=subprocess.DEVNULL
+    )
+
+
+def xfce_screenshooter_full(screenshot_path: str):
+    raise_if_missing("xfce4-screenshooter")
+    return subprocess.run(
+        ("xfce4-screenshooter", "-f", "-s", screenshot_path,),
+        check=True,
+        stderr=subprocess.DEVNULL
+    )
+
+
+def maim_full(screenshot_path: str):
+    raise_if_missing("maim")
+    return subprocess.run(
+        ("maim", "--format=png", "--quality", "1", screenshot_path,),
+        check=True,
+        stderr=sys.stdout,
+    )
+
+
+def grim_full(screenshot_path: str):
+    raise_if_missing("grim")
+    return subprocess.run(
+        ("grim", screenshot_path,),
+        check=True,
+    )
+
+
+def gnome_screenshot_active(screenshot_path: str):
+    raise_if_missing("gnome-screenshot")
+    return subprocess.run(
+        ("gnome-screenshot", "-w", "-f", screenshot_path,),
+        check=True,
+    )
+
+
+def spectacle_active(screenshot_path: str):
+    raise_if_missing("spectacle")
+    return subprocess.run(
+        ("spectacle", "-n", "-b", "-a", "-o", screenshot_path,),
+        check=True,
+        stderr=subprocess.DEVNULL
+    )
+
+
+def xfce_screenshooter_active(screenshot_path: str):
+    raise_if_missing("xfce4-screenshooter")
+    return subprocess.run(
+        ("xfce4-screenshooter", "-w", "-s", screenshot_path,),
+        check=True,
+        stderr=subprocess.DEVNULL
+    )
+
+
+def maim_active(screenshot_path: str):
+    raise_if_missing("maim", "xdotool")
+    try:
+        window_id = subprocess.check_output(["xdotool", "getactivewindow"]).decode().strip()
+        return subprocess.run(
+            ("maim", "--window", window_id, "--format=png", "--quality", "1", screenshot_path,),
+            check=True,
+            stderr=sys.stdout,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to full screen if can't get active window
+        return maim_full(screenshot_path)
+
+
+def grim_active(screenshot_path: str):
+    try:
+        raise_if_missing("grim", "swaymsg", "jq")
+        # Get active output
+        output_cmd = 'swaymsg -t get_outputs | jq -r \'.[] | select(.focused) | .name\''
+        active_output = subprocess.check_output(output_cmd, shell=True).decode().strip()
+        if active_output:
+            return subprocess.run(
+                ("grim", "-o", active_output, screenshot_path,),
+                check=True,
+            )
+        else:
+            return grim_full(screenshot_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, MissingProgram):
+        # Fallback to full screen
+        return grim_full(screenshot_path)
+
+
+def take_screenshot(screenshot_path, full_screen=False, active_monitor=False):
+    if active_monitor:
+        match CURRENT_PLATFORM:
+            case Platform.GNOME:
+                gnome_screenshot_active(screenshot_path)
+            case Platform.KDE:
+                spectacle_active(screenshot_path)
+            case Platform.XFCE:
+                xfce_screenshooter_active(screenshot_path)
+            case Platform.Xorg:
+                maim_active(screenshot_path)
+            case Platform.Wayland:
+                grim_active(screenshot_path)
+    elif full_screen:
+        match CURRENT_PLATFORM:
+            case Platform.GNOME:
+                gnome_screenshot_full(screenshot_path)
+            case Platform.KDE:
+                spectacle_full(screenshot_path)
+            case Platform.XFCE:
+                xfce_screenshooter_full(screenshot_path)
+            case Platform.Xorg:
+                maim_full(screenshot_path)
+            case Platform.Wayland:
+                grim_full(screenshot_path)
+    else:
+        match CURRENT_PLATFORM:
+            case Platform.GNOME:
+                gnome_screenshot_select(screenshot_path)
+            case Platform.KDE:
+                spectactle_select(screenshot_path)
+            case Platform.XFCE:
+                xfce_screenshooter_select(screenshot_path)
+            case Platform.Xorg:
+                maim_select(screenshot_path)
+            case Platform.Wayland:
+                grim_select(screenshot_path)
 
 
 def prepare_pipe():
@@ -498,6 +624,11 @@ class MangaOcrWrapper:
         if not command.file_path or not os.path.exists(command.file_path):
             self._debug_log(f"File not found: {command.file_path}")
             return
+        
+        # Special handling for "select" action
+        if command.action == "select":
+            self._display_image_for_selection(command.file_path)
+            return
             
         try:
             text = self._ocr(command.file_path)
@@ -507,9 +638,31 @@ class MangaOcrWrapper:
                 self._copy_to_clipboard(text)
                 notify_send(text)
         finally:
-            if command.file_path and os.path.exists(command.file_path):
+            if command.file_path and os.path.exists(command.file_path) and command.action != "select":
                 os.unlink(command.file_path)
-
+                
+    def _display_image_for_selection(self, image_path):
+        self._debug_log(f"Displaying image for selection: {image_path}")
+        try:
+            # Display image fullscreen to create a freeze effect
+            if shutil.which("feh"):
+                subprocess.Popen(["feh", "--fullscreen", "--borderless", "--hide-pointer", image_path])
+                notify_send("Screen frozen. Press q or Escape to unfreeze.")
+            elif shutil.which("eog"):
+                subprocess.Popen(["eog", "--fullscreen", image_path])
+                notify_send("Screen frozen. Press F11 or Escape to unfreeze.")
+            elif shutil.which("mpv"):
+                subprocess.Popen(["mpv", "--fullscreen", "--image-display-duration=inf", image_path])
+                notify_send("Screen frozen. Press q or Escape to unfreeze.")
+            elif shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", image_path])
+                notify_send("Screen frozen. Close the viewer to unfreeze.")
+            else:
+                notify_send("No image viewer found. Install feh, eog, or mpv for best results.")
+        except Exception as e:
+            self._debug_log(f"Error displaying image: {e}")
+            notify_send(f"Error displaying image: {e}")
+            
     def _copy_to_clipboard(self, text: str):
         cmd_args = list(self._config.clip_args or CLIP_COPY_ARGS)
         try:
@@ -749,6 +902,68 @@ def purge_manga_ocr_data():
     print("Purged all downloaded manga-ocr data.")
 
 
+def run_screenshot_copy(full_screen=False):
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+        try:
+            take_screenshot(screenshot_file.name, full_screen=full_screen)
+        except subprocess.CalledProcessError as ex:
+            raise ScreenshotCancelled() from ex
+            
+        # Add small delay to ensure file is written
+        time.sleep(0.1)
+        
+        # Copy to clipboard
+        cmd_args = list(TrOcrConfig()._config.get('clip_command_image', CLIP_COPY_ARGS) or CLIP_COPY_ARGS)
+        try:
+            if IS_XORG:
+                raise_if_missing(cmd_args[0])
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", screenshot_file.name],
+                    check=True
+                )
+            else:
+                raise_if_missing("wl-copy")
+                subprocess.run(
+                    ["wl-copy", "-t", "image/png", screenshot_file.name],
+                    check=True
+                )
+            notify_send("Screenshot copied to clipboard")
+        except (MissingProgram, subprocess.CalledProcessError) as ex:
+            notify_send(f"Failed to copy screenshot: {ex}")
+        finally:
+            # Clean up the temp file
+            os.unlink(screenshot_file.name)
+    
+def run_select_freeze(image_path=None):
+    try:
+        ensure_listening()
+        
+        if image_path is not None:
+            # Use the provided image directly
+            write_command_to_pipe("select", image_path)
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+            try:
+                # Take screenshot of active monitor to create freeze effect
+                take_screenshot(screenshot_file.name, active_monitor=True)
+            except subprocess.CalledProcessError as ex:
+                raise ScreenshotCancelled() from ex
+                
+            # Add small delay to ensure file is written
+            time.sleep(0.1)
+            
+            try:
+                write_command_to_pipe("select", screenshot_file.name)
+            except IOError as e:
+                notify_send(f"Failed to communicate with OCR service: {e}")
+                # Cleanup
+                os.unlink(screenshot_file.name)
+                raise
+    except KeyboardInterrupt:
+        notify_send("Select freeze cancelled by user")
+        sys.exit(1)
+    
 def create_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="An OCR tool that uses Transformers.",
@@ -769,6 +984,13 @@ You need to run '{prog_name()} download' once after installation.
     hold_parser = subparsers.add_parser("hold", help="OCR and hold a part of the screen.")
     hold_parser.add_argument("--image-path", help="Path to image to parse.", metavar="<path>", default=None)
     hold_parser.set_defaults(func=lambda args: run_ocr("hold", image_path=args.image_path))
+    
+    screenshot_parser = subparsers.add_parser("screenshot", help="Take a screenshot of all screens and copy to clipboard.")
+    screenshot_parser.set_defaults(func=lambda _args: run_screenshot_copy(full_screen=True))
+    
+    select_parser = subparsers.add_parser("select", help="Freeze a selected area of the screen for later OCR.")
+    select_parser.add_argument("--image-path", help="Path to image to freeze.", metavar="<path>", default=None)
+    select_parser.set_defaults(func=lambda args: run_select_freeze(image_path=args.image_path))
 
     download_parser = subparsers.add_parser("download", help="Download OCR files.")
     download_parser.set_defaults(func=lambda _args: download_manga_ocr())
