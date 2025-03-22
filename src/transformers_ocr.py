@@ -23,6 +23,10 @@ import fcntl
 import socket
 import struct
 import pickle
+from pathlib import Path
+
+# Global arguments variable
+args = None
 
 MANGA_OCR_PREFIX = os.path.join(os.environ["HOME"], ".local", "share", "manga_ocr")
 MANGA_OCR_PYENV_PATH = os.path.join(MANGA_OCR_PREFIX, "pyenv")
@@ -643,26 +647,124 @@ class MangaOcrWrapper:
                 
     def _display_image_for_selection(self, image_path):
         self._debug_log(f"Displaying image for selection: {image_path}")
+        
+        # Check if file exists and has content
+        if not os.path.exists(image_path):
+            self._debug_log(f"Error: Screenshot file not found at {image_path}")
+            notify_send("Error: Screenshot file not found")
+            return
+        
+        file_size = os.path.getsize(image_path)
+        if file_size == 0:
+            self._debug_log(f"Error: Empty screenshot file at {image_path}")
+            notify_send("Error: Empty screenshot file")
+            return
+            
+        self._debug_log(f"Screenshot file is valid: {file_size} bytes")
+        
+        # Try to add a helpful message to the image
+        temp_image_path = None
+        try:
+            if shutil.which("convert"):  # ImageMagick's convert
+                self._debug_log("Adding text overlay with ImageMagick")
+                temp_image_path = f"{image_path}.overlay.png"
+                
+                convert_cmd = [
+                    "convert", image_path,
+                    "-fill", "white", "-undercolor", "#00000080",
+                    "-gravity", "North", "-pointsize", "24",
+                    "-annotate", "+0+30", "SCREEN FROZEN - PRESS ESC OR Q TO EXIT",
+                    temp_image_path
+                ]
+                self._debug_log(f"Running convert command: {' '.join(convert_cmd)}")
+                
+                # Create a copy with text overlay
+                result = subprocess.run(
+                    convert_cmd,
+                    check=True, 
+                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE
+                )
+                
+                # Use the modified image if successful
+                if os.path.exists(temp_image_path) and os.path.getsize(temp_image_path) > 0:
+                    self._debug_log(f"Created overlay image at {temp_image_path}")
+                    image_path = temp_image_path
+                else:
+                    self._debug_log(f"Overlay image not created or empty, using original")
+            else:
+                self._debug_log("ImageMagick convert not found, skipping text overlay")
+        except Exception as e:
+            self._debug_log(f"Failed to add text overlay: {e}\n{traceback.format_exc()}")
+            # Continue with original image if text overlay fails
+        
         try:
             # Display image fullscreen to create a freeze effect
-            if shutil.which("feh"):
-                subprocess.Popen(["feh", "--fullscreen", "--borderless", "--hide-pointer", image_path])
-                notify_send("Screen frozen. Press q or Escape to unfreeze.")
-            elif shutil.which("eog"):
-                subprocess.Popen(["eog", "--fullscreen", image_path])
-                notify_send("Screen frozen. Press F11 or Escape to unfreeze.")
-            elif shutil.which("mpv"):
-                subprocess.Popen(["mpv", "--fullscreen", "--image-display-duration=inf", image_path])
-                notify_send("Screen frozen. Press q or Escape to unfreeze.")
-            elif shutil.which("xdg-open"):
-                subprocess.Popen(["xdg-open", image_path])
-                notify_send("Screen frozen. Close the viewer to unfreeze.")
-            else:
-                notify_send("No image viewer found. Install feh, eog, or mpv for best results.")
-        except Exception as e:
-            self._debug_log(f"Error displaying image: {e}")
-            notify_send(f"Error displaying image: {e}")
+            viewer_cmd = None
             
+            # Try each viewer in order of preference
+            if shutil.which("feh"):
+                self._debug_log("Using feh as image viewer")
+                viewer_cmd = ["feh", "--fullscreen", "--borderless", "--hide-pointer", "--auto-zoom", image_path]
+            elif shutil.which("mpv"):
+                self._debug_log("Using mpv as image viewer")
+                viewer_cmd = ["mpv", "--fullscreen", "--keep-open=yes", "--image-display-duration=inf", image_path]
+            elif shutil.which("eog"):
+                self._debug_log("Using eog (Eye of GNOME) as image viewer")
+                viewer_cmd = ["eog", "--fullscreen", image_path]
+            elif shutil.which("xdg-open"):
+                self._debug_log("Using xdg-open as image viewer")
+                viewer_cmd = ["xdg-open", image_path]
+            
+            if not viewer_cmd:
+                self._debug_log("No suitable image viewer found")
+                notify_send("No suitable image viewer found. Install feh, mpv, or eog for best results.")
+                return
+            
+            self._debug_log(f"Launching viewer with command: {' '.join(viewer_cmd)}")
+            
+            # Use Popen with start_new_session=True to detach from parent process
+            process = subprocess.Popen(
+                viewer_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True
+            )
+            
+            # Check if process started successfully
+            time.sleep(0.5)
+            if process.poll() is not None:
+                stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                stdout = process.stdout.read().decode('utf-8', errors='ignore')
+                self._debug_log(f"Viewer failed to start with return code {process.returncode}")
+                self._debug_log(f"STDOUT: {stdout}")
+                self._debug_log(f"STDERR: {stderr}")
+                notify_send(f"Failed to display image: Viewer exited immediately with code {process.returncode}")
+                return
+                
+            self._debug_log(f"Viewer process started with PID {process.pid}")
+            
+            # Notify based on which viewer was used
+            if "feh" in viewer_cmd[0]:
+                notify_send("Screen frozen. Press q or Escape to unfreeze.")
+            elif "mpv" in viewer_cmd[0]:
+                notify_send("Screen frozen. Press q or Escape to unfreeze.")
+            elif "eog" in viewer_cmd[0]:
+                notify_send("Screen frozen. Press F11 or Escape to unfreeze.")
+            else:
+                notify_send("Screen frozen. Close the viewer to unfreeze.")
+            
+        except Exception as e:
+            self._debug_log(f"Error displaying image: {e}\n{traceback.format_exc()}")
+            notify_send(f"Error displaying image: {e}")
+        finally:
+            # Clean up temporary file if created
+            if temp_image_path and os.path.exists(temp_image_path) and temp_image_path != image_path:
+                try:
+                    os.unlink(temp_image_path)
+                except OSError:
+                    pass
+
     def _copy_to_clipboard(self, text: str):
         cmd_args = list(self._config.clip_args or CLIP_COPY_ARGS)
         try:
@@ -785,7 +887,19 @@ class OcrServer:
                 os.unlink(SOCKET_PATH)
                 sys.exit(0)
                 
-            self._wrapper._process_command(command)
+            if command.action == "select":
+                self._debug_log(f"Received select command with file: {command.file_path}")
+                if os.path.exists(command.file_path):
+                    self._debug_log(f"File exists and is {os.path.getsize(command.file_path)} bytes")
+                else:
+                    self._debug_log(f"File does not exist: {command.file_path}")
+            
+            try:
+                self._debug_log(f"Processing command: {command.action}")
+                self._wrapper._process_command(command)
+                self._debug_log(f"Command {command.action} processed successfully")
+            except Exception as e:
+                self._debug_log(f"Error processing command {command.action}: {e}\n{traceback.format_exc()}")
             
         except Exception as e:
             self._debug_log(f"Error handling connection: {e}\n{traceback.format_exc()}")
@@ -902,6 +1016,47 @@ def purge_manga_ocr_data():
     print("Purged all downloaded manga-ocr data.")
 
 
+def try_alternative_screenshot(screenshot_path: str, debug=False):
+    """
+    Try alternative methods to take a screenshot if the primary methods are failing.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # For X11/Xorg systems, try using import from ImageMagick which is often more reliable
+        if IS_XORG and shutil.which("import"):
+            debug_log("Trying ImageMagick import for screenshot", debug)
+            subprocess.run(
+                ["import", "-window", "root", screenshot_path],
+                check=True,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+            
+        # For Wayland, try a more direct approach with grim if available
+        if not IS_XORG and shutil.which("grim"):
+            debug_log("Trying direct grim for screenshot", debug)
+            subprocess.run(
+                ["grim", screenshot_path],
+                check=True, 
+                stderr=subprocess.DEVNULL
+            )
+            return True
+            
+        # If scrot is available, try that as well (works on most X11 systems)
+        if shutil.which("scrot"):
+            debug_log("Trying scrot for screenshot", debug)
+            subprocess.run(
+                ["scrot", "-o", screenshot_path],
+                check=True,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+            
+        return False
+    except subprocess.CalledProcessError:
+        return False
+
+
 def run_screenshot_copy(full_screen=False):
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
         try:
@@ -936,26 +1091,61 @@ def run_screenshot_copy(full_screen=False):
     
 def run_select_freeze(image_path=None):
     try:
+        debug_log("Starting select_freeze operation", args.debug)
         ensure_listening()
         
         if image_path is not None:
+            debug_log(f"Using provided image: {image_path}", args.debug)
             # Use the provided image directly
             write_command_to_pipe("select", image_path)
             return
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+            debug_log(f"Creating screenshot at: {screenshot_file.name}", args.debug)
+            
+            screenshot_success = False
             try:
-                # Take screenshot of active monitor to create freeze effect
+                # First try the standard method
+                debug_log("Taking screenshot of active monitor", args.debug)
                 take_screenshot(screenshot_file.name, active_monitor=True)
-            except subprocess.CalledProcessError as ex:
-                raise ScreenshotCancelled() from ex
+                screenshot_success = True
+                debug_log("Standard screenshot successful", args.debug)
+            except subprocess.CalledProcessError:
+                debug_log("Standard screenshot method failed, trying alternatives", args.debug)
+                pass
+            
+            # If the primary method fails, try alternative methods
+            if not screenshot_success or not os.path.exists(screenshot_file.name) or os.path.getsize(screenshot_file.name) == 0:
+                debug_log("Trying alternative screenshot methods", args.debug)
+                screenshot_success = try_alternative_screenshot(screenshot_file.name, args.debug)
                 
-            # Add small delay to ensure file is written
-            time.sleep(0.1)
+            # Verify the screenshot was created successfully
+            if not screenshot_success or not os.path.exists(screenshot_file.name) or os.path.getsize(screenshot_file.name) == 0:
+                notify_send("Failed to create screenshot. Make sure you have screenshot tools installed.")
+                debug_log("All screenshot methods failed", args.debug)
+                return
+                
+            debug_log(f"Screenshot created successfully: {os.path.getsize(screenshot_file.name)} bytes", args.debug)
+                
+            # Always save a debug copy when in debug mode
+            if args.debug:
+                debug_copy = "/tmp/manga_ocr_debug_screenshot.png"
+                debug_log(f"Saving debug copy to {debug_copy}", args.debug)
+                try:
+                    shutil.copy2(screenshot_file.name, debug_copy)
+                    os.chmod(debug_copy, 0o644)  # Make readable by all users
+                    notify_send(f"Saved debug screenshot to {debug_copy}")
+                except Exception as e:
+                    debug_log(f"Failed to save debug copy: {e}", args.debug)
+                
+            # Add small delay to ensure file is written and closed
+            time.sleep(0.5)
             
             try:
+                debug_log("Sending select command to OCR service", args.debug)
                 write_command_to_pipe("select", screenshot_file.name)
             except IOError as e:
+                debug_log(f"Failed to communicate with OCR service: {e}", args.debug)
                 notify_send(f"Failed to communicate with OCR service: {e}")
                 # Cleanup
                 os.unlink(screenshot_file.name)
@@ -963,7 +1153,210 @@ def run_select_freeze(image_path=None):
     except KeyboardInterrupt:
         notify_send("Select freeze cancelled by user")
         sys.exit(1)
+    except Exception as e:
+        debug_log(f"Unexpected error in select_freeze: {e}\n{traceback.format_exc()}", args.debug)
+        notify_send(f"Error: {e}")
+        sys.exit(1)
+
+
+def freeze_screen_directly():
+    """
+    Take a screenshot of the active monitor and display it fullscreen
+    without going through the OCR service. This provides a more direct
+    and reliable way to freeze the screen.
+    """
+    # Get debug state from args or assume False if not available
+    debug_enabled = False
+    try:
+        global args
+        if args and hasattr(args, 'debug'):
+            debug_enabled = args.debug
+    except NameError:
+        pass
     
+    # Always log to console regardless of debug flag
+    print("[freeze_screen_directly] Starting direct screen freeze")
+    
+    # Create a temporary file for the screenshot
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+        screenshot_path = screenshot_file.name
+        print(f"[freeze_screen_directly] Creating screenshot at: {screenshot_path}")
+        
+        # Take screenshot
+        try:
+            # First try the standard method
+            print("[freeze_screen_directly] Taking screenshot of active monitor")
+            take_screenshot(screenshot_path, active_monitor=True)
+            print("[freeze_screen_directly] Screenshot successful")
+        except Exception as e:
+            print(f"[freeze_screen_directly] Standard screenshot method failed: {e}")
+            # Try alternative methods
+            if not try_alternative_screenshot(screenshot_path, debug_enabled):
+                notify_send("Failed to create screenshot")
+                os.unlink(screenshot_path)
+                return
+        
+        # Verify the screenshot was created successfully
+        if not os.path.exists(screenshot_path) or os.path.getsize(screenshot_path) == 0:
+            notify_send("Failed to create screenshot")
+            os.unlink(screenshot_path)
+            return
+            
+        print(f"[freeze_screen_directly] Screenshot created: {os.path.getsize(screenshot_path)} bytes")
+            
+        # Try to add text overlay
+        temp_image_path = None
+        try:
+            if shutil.which("convert"):
+                print("[freeze_screen_directly] Adding text overlay")
+                temp_image_path = f"{screenshot_path}.overlay.png"
+                
+                # Create a copy with text overlay
+                subprocess.run([
+                    "convert", screenshot_path,
+                    "-fill", "white", "-undercolor", "#00000080",
+                    "-gravity", "North", "-pointsize", "24",
+                    "-annotate", "+0+30", "SCREEN FROZEN - PRESS ESC OR Q TO EXIT",
+                    temp_image_path
+                ], check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+                
+                if os.path.exists(temp_image_path) and os.path.getsize(temp_image_path) > 0:
+                    print(f"Using overlay image: {temp_image_path}")
+                    display_path = temp_image_path
+                else:
+                    print("Overlay creation failed, using original image")
+                    display_path = screenshot_path
+            else:
+                print("ImageMagick convert not found, skipping text overlay")
+                display_path = screenshot_path
+        except Exception as e:
+            print(f"[freeze_screen_directly] Failed to add overlay: {e}")
+            display_path = screenshot_path
+        
+        # Display the image
+        viewer_cmd = None
+        if shutil.which("feh"):
+            print("[freeze_screen_directly] Using feh as viewer")
+            viewer_cmd = ["feh", "--fullscreen", "--borderless", "--hide-pointer", "--auto-zoom", display_path]
+            viewer_exit_msg = "Press q or Escape to unfreeze"
+        elif shutil.which("mpv"):
+            print("[freeze_screen_directly] Using mpv as viewer")
+            viewer_cmd = ["mpv", "--fullscreen", "--keep-open=yes", "--image-display-duration=inf", display_path]
+            viewer_exit_msg = "Press q or Escape to unfreeze"
+        elif shutil.which("eog"):
+            print("[freeze_screen_directly] Using eog as viewer")
+            viewer_cmd = ["eog", "--fullscreen", display_path]
+            viewer_exit_msg = "Press F11 or Escape to unfreeze"
+        elif shutil.which("xdg-open"):
+            print("[freeze_screen_directly] Using xdg-open as viewer")
+            viewer_cmd = ["xdg-open", display_path]
+            viewer_exit_msg = "Close the viewer to unfreeze"
+        
+        if not viewer_cmd:
+            notify_send("No suitable image viewer found")
+            os.unlink(screenshot_path)
+            if temp_image_path and os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
+            return
+            
+        try:
+            print(f"[freeze_screen_directly] Launching viewer: {' '.join(viewer_cmd)}")
+            # Use Popen with pipes for stdout/stderr to capture output
+            process = subprocess.Popen(
+                viewer_cmd, 
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True
+            )
+            notify_send(f"Screen frozen. {viewer_exit_msg}")
+            
+            # Wait a moment to see if the process started successfully
+            time.sleep(0.5)
+            if process.poll() is not None:
+                stdout = process.stdout.read().decode('utf-8', errors='ignore')
+                stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                print(f"Viewer failed to start with code {process.returncode}")
+                print(f"STDOUT: {stdout}")
+                print(f"STDERR: {stderr}")
+                notify_send("Failed to display frozen screen")
+            else:
+                print(f"Viewer started with PID {process.pid}")
+                # Wait for the process to complete (this will wait until the user closes the viewer)
+                process.wait()
+                print("Viewer closed")
+        except Exception as e:
+            print(f"Error displaying frozen screen: {e}\n{traceback.format_exc()}")
+            notify_send(f"Error: {e}")
+        finally:
+            # Clean up temporary files
+            try:
+                if screenshot_path and os.path.exists(screenshot_path):
+                    os.unlink(screenshot_path)
+                if temp_image_path and os.path.exists(temp_image_path) and temp_image_path != screenshot_path:
+                    os.unlink(temp_image_path)
+            except Exception as e:
+                print(f"Error cleaning up temporary files: {e}")
+    
+    # Exit after standalone freeze operation
+    sys.exit(0)
+
+
+def run_select_standalone(image_path=None):
+    """Run the select freeze command in standalone mode"""
+    if image_path:
+        # If an image path is provided, use the original method
+        return run_select_freeze(image_path=image_path)
+    
+    # Otherwise, use the standalone mode by re-executing this script with the special flag
+    try:
+        print("Starting standalone screen freeze...")
+        # Run ourselves as a new process with the standalone flag
+        script_path = os.path.abspath(__file__)
+        
+        log_file = "/tmp/manga_ocr_freeze_log.txt"
+        
+        # Create a clear marker in the log file
+        with open(log_file, "w") as f:
+            f.write(f"=== FREEZE STARTED AT {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        
+        # Execute in a separate process and redirect stdout/stderr to the log file
+        p = subprocess.Popen(
+            [sys.executable, script_path, "--standalone-freeze"],
+            stdout=open(log_file, "a"),
+            stderr=subprocess.STDOUT
+        )
+        
+        # Wait a bit and check if the process is still running
+        time.sleep(1)
+        if p.poll() is not None:
+            # Process ended quickly, probably an error
+            print(f"Standalone freeze process exited quickly with code {p.returncode}")
+            print("Check log file for details: " + log_file)
+            
+            # Display the log file contents
+            try:
+                with open(log_file, "r") as f:
+                    log_content = f.read()
+                    print("\nLog file contents:")
+                    print(log_content)
+            except Exception as e:
+                print(f"Error reading log file: {e}")
+                
+            notify_send("Screen freeze failed")
+            return False
+        
+        # Process is running, assume it's working
+        print(f"Standalone freeze process started successfully (PID: {p.pid})")
+        print(f"Check log file for details: {log_file}")
+        
+        return True
+    except Exception as e:
+        print(f"Failed to launch standalone freeze: {e}")
+        traceback.print_exc()
+        notify_send(f"Error starting screen freeze: {e}")
+        return False
+
+
 def create_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="An OCR tool that uses Transformers.",
@@ -988,9 +1381,9 @@ You need to run '{prog_name()} download' once after installation.
     screenshot_parser = subparsers.add_parser("screenshot", help="Take a screenshot of all screens and copy to clipboard.")
     screenshot_parser.set_defaults(func=lambda _args: run_screenshot_copy(full_screen=True))
     
-    select_parser = subparsers.add_parser("select", help="Freeze a selected area of the screen for later OCR.")
-    select_parser.add_argument("--image-path", help="Path to image to freeze.", metavar="<path>", default=None)
-    select_parser.set_defaults(func=lambda args: run_select_freeze(image_path=args.image_path))
+    select_parser = subparsers.add_parser("select", help="Freeze the current screen by taking a screenshot and displaying it fullscreen.")
+    select_parser.add_argument("--image-path", help="Path to image to freeze instead of taking a screenshot.", metavar="<path>", default=None)
+    select_parser.set_defaults(func=lambda args: run_select_standalone(image_path=args.image_path))
 
     download_parser = subparsers.add_parser("download", help="Download OCR files.")
     download_parser.set_defaults(func=lambda _args: download_manga_ocr())
@@ -1037,6 +1430,255 @@ def main():
         notify_send(str(ex))
     except ScreenshotCancelled:
         notify_send("Screenshot cancelled.")
+
+
+# Check if we're being called directly as a standalone script
+if __name__ == "__main__" and "--standalone-freeze" in sys.argv:
+    # This is a standalone call just to freeze the screen
+    
+    with open("/tmp/manga_ocr_freeze_log.txt", "a") as log:
+        log.write("Starting standalone screen freeze...\n")
+        log.write(f"Current directory: {os.getcwd()}\n")
+        log.write(f"Python executable: {sys.executable}\n")
+        log.write(f"Python path: {sys.path}\n")
+        log.write(f"Script path: {__file__}\n")
+        log.write(f"Arguments: {sys.argv}\n")
+    
+    print("Starting standalone screen freeze...")
+    
+    def notify_send(message):
+        """Send a notification"""
+        try:
+            if shutil.which("notify-send"):
+                subprocess.run(["notify-send", "Manga OCR", message], check=False)
+            else:
+                print(f"NOTIFICATION: {message}")
+        except Exception as e:
+            print(f"Failed to send notification: {e}")
+    
+    def take_screenshot(file_path, active_monitor=True, full_screen=False):
+        """Take a screenshot and save it to the given file path"""
+        print(f"Taking screenshot to {file_path}")
+        
+        # Default to active monitor if no other option is specified
+        if not active_monitor and not full_screen:
+            active_monitor = True
+            
+        if sys.platform == "darwin":  # macOS
+            if active_monitor:
+                subprocess.run(["screencapture", "-x", file_path], check=True)
+            else:  # full_screen
+                subprocess.run(["screencapture", "-x", file_path], check=True)
+        elif sys.platform == "win32":  # Windows
+            # Import only when needed
+            try:
+                from PIL import ImageGrab
+                image = ImageGrab.grab()
+                image.save(file_path)
+            except Exception as e:
+                print(f"Error taking screenshot with PIL: {e}")
+                notify_send(f"Error taking screenshot: {e}")
+                raise
+        else:  # Linux/Unix
+            try:
+                if shutil.which("maim"):
+                    if active_monitor:
+                        # Capture active monitor with maim (-i $(xdotool getactivewindow))
+                        subprocess.run(["maim", "-u", file_path], check=True)
+                    else:  # full_screen
+                        subprocess.run(["maim", file_path], check=True)
+                elif shutil.which("gnome-screenshot"):
+                    subprocess.run(["gnome-screenshot", "-f", file_path], check=True)
+                elif shutil.which("scrot"):
+                    subprocess.run(["scrot", file_path], check=True)
+                elif shutil.which("import"):
+                    subprocess.run(["import", "-window", "root", file_path], check=True)
+                else:
+                    notify_send("No screenshot program found. Please install maim, gnome-screenshot, scrot, or import.")
+                    raise FileNotFoundError("No screenshot program found")
+            except Exception as e:
+                print(f"Error taking screenshot: {e}")
+                notify_send(f"Error taking screenshot: {e}")
+                raise
+    
+    def try_alternative_screenshot(file_path):
+        """Try alternative methods for taking screenshots"""
+        print("Trying alternative screenshot methods...")
+        
+        methods = [
+            # Try full screen methods first
+            lambda: subprocess.run(["maim", file_path], check=True),
+            lambda: subprocess.run(["gnome-screenshot", "-f", file_path], check=True),
+            lambda: subprocess.run(["scrot", file_path], check=True),
+            lambda: subprocess.run(["import", "-window", "root", file_path], check=True),
+            
+            # Try X11 specific methods
+            lambda: subprocess.run(["xwd", "-root", "-out", "/tmp/x11_screen.xwd"], check=True) and
+                    subprocess.run(["convert", "/tmp/x11_screen.xwd", file_path], check=True),
+        ]
+        
+        for i, method in enumerate(methods):
+            try:
+                print(f"Trying method {i+1}...")
+                method()
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    print(f"Screenshot successful with method {i+1}")
+                    return True
+            except Exception as e:
+                print(f"Method {i+1} failed: {e}")
+                continue
+                
+        return False
+    
+    # Create a temporary file for the screenshot
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as screenshot_file:
+        screenshot_path = screenshot_file.name
+        print(f"Creating screenshot at: {screenshot_path}")
+        
+        # Save a debug copy
+        debug_path = "/tmp/manga_ocr_debug_screenshot.png"
+        
+        try:
+            # Take screenshot
+            try:
+                # First try the standard method
+                take_screenshot(screenshot_path, active_monitor=True)
+                print("Screenshot successful")
+                
+                # Save a debug copy
+                shutil.copy(screenshot_path, debug_path)
+                print(f"Debug copy saved to {debug_path}")
+            except Exception as e:
+                print(f"Standard screenshot method failed: {e}")
+                
+                # Try alternative methods
+                if not try_alternative_screenshot(screenshot_path):
+                    notify_send("Failed to create screenshot")
+                    os.unlink(screenshot_path)
+                    sys.exit(1)
+                
+                # Save a debug copy of the alternative screenshot
+                shutil.copy(screenshot_path, debug_path)
+                print(f"Debug copy of alternative screenshot saved to {debug_path}")
+            
+            # Verify the screenshot was created successfully
+            if not os.path.exists(screenshot_path) or os.path.getsize(screenshot_path) == 0:
+                print("Screenshot file is empty or not created")
+                notify_send("Failed to create screenshot")
+                os.unlink(screenshot_path)
+                sys.exit(1)
+                
+            print(f"Screenshot created: {os.path.getsize(screenshot_path)} bytes")
+                
+            # Try to add text overlay
+            temp_image_path = None
+            try:
+                if shutil.which("convert"):
+                    print("Adding text overlay")
+                    temp_image_path = f"{screenshot_path}.overlay.png"
+                    
+                    # Create a copy with text overlay
+                    print("Running convert command...")
+                    process = subprocess.run([
+                        "convert", screenshot_path,
+                        "-fill", "white", "-undercolor", "#00000080",
+                        "-gravity", "North", "-pointsize", "24",
+                        "-annotate", "+0+30", "SCREEN FROZEN - PRESS ESC OR Q TO EXIT",
+                        temp_image_path
+                    ], check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+                    
+                    if os.path.exists(temp_image_path) and os.path.getsize(temp_image_path) > 0:
+                        print(f"Using overlay image: {temp_image_path}")
+                        display_path = temp_image_path
+                        # Save a debug copy of the overlay
+                        shutil.copy(temp_image_path, "/tmp/manga_ocr_debug_screenshot_overlay.png")
+                    else:
+                        print("Overlay creation failed, using original image")
+                        display_path = screenshot_path
+                else:
+                    print("ImageMagick convert not found, skipping text overlay")
+                    display_path = screenshot_path
+            except Exception as e:
+                print(f"Failed to add overlay: {e}\n{traceback.format_exc()}")
+                display_path = screenshot_path
+            
+            # Display the image
+            viewer_cmd = None
+            if shutil.which("feh"):
+                print("Using feh as viewer")
+                viewer_cmd = ["feh", "--fullscreen", "--borderless", "--hide-pointer", "--auto-zoom", display_path]
+                viewer_exit_msg = "Press q or Escape to unfreeze"
+            elif shutil.which("mpv"):
+                print("Using mpv as viewer")
+                viewer_cmd = ["mpv", "--fullscreen", "--keep-open=yes", "--image-display-duration=inf", display_path]
+                viewer_exit_msg = "Press q or Escape to unfreeze"
+            elif shutil.which("eog"):
+                print("Using eog as viewer")
+                viewer_cmd = ["eog", "--fullscreen", display_path]
+                viewer_exit_msg = "Press F11 or Escape to unfreeze"
+            elif shutil.which("xdg-open"):
+                print("Using xdg-open as viewer")
+                viewer_cmd = ["xdg-open", display_path]
+                viewer_exit_msg = "Close the viewer to unfreeze"
+            
+            if not viewer_cmd:
+                print("No suitable image viewer found")
+                notify_send("No suitable image viewer found")
+                os.unlink(screenshot_path)
+                if temp_image_path and os.path.exists(temp_image_path):
+                    os.unlink(temp_image_path)
+                sys.exit(1)
+                
+            try:
+                print(f"Launching viewer: {' '.join(viewer_cmd)}")
+                # Use Popen with pipes for stdout/stderr to capture output
+                process = subprocess.Popen(
+                    viewer_cmd, 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True
+                )
+                notify_send(f"Screen frozen. {viewer_exit_msg}")
+                
+                # Wait a moment to see if the process started successfully
+                time.sleep(0.5)
+                if process.poll() is not None:
+                    stdout = process.stdout.read().decode('utf-8', errors='ignore')
+                    stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                    print(f"Viewer failed to start with code {process.returncode}")
+                    print(f"STDOUT: {stdout}")
+                    print(f"STDERR: {stderr}")
+                    notify_send("Failed to display frozen screen")
+                    sys.exit(1)
+                else:
+                    print(f"Viewer started with PID {process.pid}")
+                    # Wait for the process to complete (this will wait until the user closes the viewer)
+                    process.wait()
+                    print("Viewer closed")
+            except Exception as e:
+                print(f"Error displaying frozen screen: {e}\n{traceback.format_exc()}")
+                notify_send(f"Error: {e}")
+                sys.exit(1)
+        except KeyboardInterrupt:
+            print("Operation cancelled by user")
+            notify_send("Screen freeze cancelled")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Unexpected error: {e}\n{traceback.format_exc()}")
+            notify_send(f"Error: {e}")
+            sys.exit(1)
+        finally:
+            # Clean up temporary files
+            try:
+                if screenshot_path and os.path.exists(screenshot_path):
+                    os.unlink(screenshot_path)
+                if temp_image_path and os.path.exists(temp_image_path) and temp_image_path != screenshot_path:
+                    os.unlink(temp_image_path)
+            except Exception as e:
+                print(f"Error cleaning up temporary files: {e}")
+    
+    # Exit after standalone freeze operation
+    sys.exit(0)
 
 
 if __name__ == "__main__":
