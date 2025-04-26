@@ -46,7 +46,7 @@ IS_GNOME = os.environ.get("XDG_CURRENT_DESKTOP") == "GNOME"
 IS_KDE = os.environ.get("XDG_CURRENT_DESKTOP") == "KDE"
 IS_XFCE = os.environ.get("XDG_CURRENT_DESKTOP") == "XFCE"
 CLIP_COPY_ARGS = (
-    ("xclip", "-selection", "clipboard",)
+    ("xsel", "--clipboard", "--input")
     if IS_XORG
     else ("wl-copy",)
 )
@@ -1072,10 +1072,11 @@ def run_screenshot_copy(full_screen=False):
         try:
             if IS_XORG:
                 raise_if_missing(cmd_args[0])
+                # 1) run magick → capture its stdout (blocks until done)
                 subprocess.run(
-                    ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", screenshot_file.name],
-                    check=True
+                    ["magick", screenshot_file.name, "clipboard:"]
                 )
+                print("✔ screenshot copied to clipboard")
             else:
                 raise_if_missing("wl-copy")
                 subprocess.run(
